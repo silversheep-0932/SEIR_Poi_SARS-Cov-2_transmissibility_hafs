@@ -23,14 +23,13 @@
 
 
   <div class="card">
-    <h3>1) 파일 업로드</h3>
-    <small>신규 확진자(일별) CSV, 인구수(월별) CSV</small>
-    <label>신규 확진자 CSV (일별) — 헤더 예: 일자,서울,부산,... (날짜: YYYY-MM-DD)</label>
-    <input id="casesFile" type="file" accept=".csv" />
-    <label>인구수 CSV (월별) — 헤더 예: 일자,서울,부산,... (일자: YYYY-MM)</label>
-    <input id="popFile" type="file" accept=".csv" />
+    <h3>1) 데이터 자동 불러오기</h3>
+    <small>저장소(data/cases.csv, data/population.csv)에서 자동 로딩됩니다.</small>
+
+    <button id="loadDataBtn">CSV 자동 불러오기</button>
     <div id="fileStatus" style="margin-top:8px;color:green"></div>
   </div>
+
 
   <div class="card">
     <h3>2) 입력 (달력 범위: 2020-01-01 ~ 2023-12-31)</h3>
@@ -130,25 +129,36 @@ let regions = [];
 // ---------------------------
 const fileStatus = document.getElementById('fileStatus');
 
-document.getElementById('casesFile').addEventListener('change', async (e)=>{
-  try{
-    const txt = await e.target.files[0].text();
-    const parsed = parseCSVText(txt);
-    casesHeader = parsed.header; casesRows = parsed.rows;
-    buildCasesIndex();
-    fileStatus.innerHTML = (fileStatus.innerHTML?fileStatus.innerHTML+'<br>':'') + '📌 확진자 CSV 업로드 완료';
-  } catch(err){ fileStatus.innerHTML = '확진자 CSV 읽기 실패: ' + err.message; }
+document.getElementById("loadDataBtn").addEventListener("click", async () => {
+    try {
+        document.getElementById("fileStatus").textContent = "CSV 불러오는 중...";
+
+        // 서버의 data 폴더에서 불러오기
+        const casesRes = await fetch("data/cases.csv");
+        const popRes   = await fetch("data/population.csv");
+
+        if (!casesRes.ok || !popRes.ok) {
+            throw new Error("CSV 파일을 불러올 수 없습니다. data 폴더를 확인하세요.");
+        }
+
+        const casesText = await casesRes.text();
+        const popText   = await popRes.text();
+
+        // 파싱 함수 호출 (이미 만든 parseCSV 함수 사용)
+        const casesData = parseCSV(casesText);
+        const popData   = parseCSV(popText);
+
+        window.loadedCases = casesData;
+        window.loadedPop   = popData;
+
+        document.getElementById("fileStatus").textContent = "CSV 자동 불러오기 성공!";
+    } 
+    catch (err) {
+        document.getElementById("fileStatus").textContent = "불러오기 실패: " + err.message;
+        console.error(err);
+    }
 });
 
-document.getElementById('popFile').addEventListener('change', async (e)=>{
-  try{
-    const txt = await e.target.files[0].text();
-    const parsed = parseCSVText(txt);
-    popHeader = parsed.header; popRows = parsed.rows;
-    buildPopulationIndex();
-    fileStatus.innerHTML = (fileStatus.innerHTML?fileStatus.innerHTML+'<br>':'') + '📌 인구수 CSV 업로드 완료';
-  } catch(err){ fileStatus.innerHTML = '인구 CSV 읽기 실패: ' + err.message; }
-});
 
 // ---------------------------
 // 인덱스 빌드
@@ -463,3 +473,4 @@ document.getElementById('runBtn').addEventListener('click', ()=>{
 </script>
 </body>
 </html>
+
