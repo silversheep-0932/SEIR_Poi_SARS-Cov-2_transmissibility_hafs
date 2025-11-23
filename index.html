@@ -288,6 +288,7 @@ function seir_step(S, E, I, beta_day, sigma, gamma){
 
 function calcBetaFromTH(T, H){
     return -0.0001712316*(H**2)+0.0108354543*H+0.49881235810
+  +Math.exp(5.2*(-0.003167*T + 0.23195)) / 5.2
 
 }
 // --- SEIR 기반으로 '현재 날짜까지' 모델을 맞추고
@@ -480,6 +481,7 @@ document.getElementById('runBtn').addEventListener('click', ()=>{
 </script>
 </body>
 </html>
+
 
 
 
