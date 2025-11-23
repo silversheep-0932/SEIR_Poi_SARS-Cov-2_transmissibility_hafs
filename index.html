@@ -145,11 +145,18 @@ document.getElementById("loadDataBtn").addEventListener("click", async () => {
         const popText   = await popRes.text();
 
         // 파싱 함수 호출 (이미 만든 parseCSV 함수 사용)
-        const casesData = parseCSV(casesText);
-        const popData   = parseCSV(popText);
+        const casesData = parseCSVText(casesText);
+        const popData   = parseCSVText(popText);
 
-        window.loadedCases = casesData;
-        window.loadedPop   = popData;
+        casesHeader = casesData.header;
+        casesRows   = casesData.rows;
+
+        popHeader = popData.header;
+        popRows   = popData.rows;
+
+        buildCasesIndex();
+        buildPopulationIndex();
+
 
         document.getElementById("fileStatus").textContent = "CSV 자동 불러오기 성공!";
     } 
@@ -473,4 +480,5 @@ document.getElementById('runBtn').addEventListener('click', ()=>{
 </script>
 </body>
 </html>
+
 
