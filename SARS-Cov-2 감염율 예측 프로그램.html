@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SEIR 감염확률 계산기</title>
+  <style>
+    body{font-family:system-ui,Arial;margin:18px auto;max-width:980px;padding:12px}
+    .card{border:1px solid #e6e6e6;border-radius:8px;padding:12px;margin:12px 0}
+    label{display:block;margin:8px 0 4px}
+    input,select,button{font-size:14px;padding:8px;width:100%;box-sizing:border-box}
+    .row{display:flex;gap:12px}
+    .col{flex:1}
+    pre{background:#fafafa;padding:10px;border-radius:6px;overflow:auto}
+    small{color:#666}
+  </style>
+</head>
+<body>
+  <h1>SEIR 기반 SARS-CoV-2 감염확률 계산기</h1>
+  <div style="font-size:12px; color:#777; margin-top:-10px; margin-bottom:14px;">
+  ※ 외대부고 학생들이 실험적으로 만든 프로그램으로, 실제 정확도는 떨어질 수 있습니다.
+  </div>
+
+
+  <div class="card">
+    <h3>1) 파일 업로드</h3>
+    <small>신규 확진자(일별) CSV, 인구수(월별) CSV</small>
+    <label>신규 확진자 CSV (일별) — 헤더 예: 일자,서울,부산,... (날짜: YYYY-MM-DD)</label>
+    <input id="casesFile" type="file" accept=".csv" />
+    <label>인구수 CSV (월별) — 헤더 예: 일자,서울,부산,... (일자: YYYY-MM)</label>
+    <input id="popFile" type="file" accept=".csv" />
+    <div id="fileStatus" style="margin-top:8px;color:green"></div>
+  </div>
+
+  <div class="card">
+    <h3>2) 입력 (달력 범위: 2020-01-01 ~ 2023-12-31)</h3>
+    <div class="row">
+      <div class="col">
+        <label>현재 날짜 (2020. 01. 20. ~ 2023. 08. 31.)</label>
+        <input id="currentDate" type="date" min="2020-01-01" max="2023-12-31" />
+                
+        <label style="margin-top:10px">지역(시도)</label>
+        <select id="region"><option value="">(파일 업로드 후 선택)</option></select>
+
+        <label style="margin-top:10px">온도 (°C)</label>
+        <input id="tempInput" type="number" step="0.1" value="20">
+
+        <label>상대습도 (% RH) (20-80%)</label>
+        <input id="humInput" type="number" step="0.1" value="50">
+
+      </div>
+      <div class="col">
+        <label>실내 면적 (㎡)</label>
+        <input id="area" type="number" value="50" />
+        <label>활성도 (예: 5-20, 클수록 사람들이 활발하게 움직임)</label>
+        <input id="activity" type="number" step="0.1" value="1.0" />
+        <label>예상 체류 시간 (h)</label>
+        <input id="duration" type="number" step="0.1" value="2" />
+
+            </div>
+        </div>
+  </div>
+
+  <div class="card">
+    <h3>3) 실행</h3>
+    <button id="runBtn">계산 시작</button>
+    <div id="status" style="margin-top:8px;color:#b33"></div>
+  </div>
+
+  <div class="card">
+    <h3>결과</h3>
+    <div id="output"></div>
+  </div>
+
+  <div class="card">
+    <h3>디버그 (오류가 나면 이 내용을 그대로 붙여줘)</h3>
+    <pre id="debug"></pre>
+  </div>
+
+<script>
+// ---------------------------
+// 내부 상수 (UI에 노출되지 않음)
+// ---------------------------
+const beta_SEIR = 0.48; // 1/day, SEIR 전용
+const latent_days = 2; // 잠복기간(일)
+
+// ---------------------------
+// CSV 파서 (따옴표 내부 콤마 처리, 천단위 쉼표 제거)
+// ---------------------------
+function splitCSVLine(line){
+  const res=[]; let cur=''; let inQ=false;
+  for(let i=0;i<line.length;i++){
+    const ch=line[i];
+    if(ch === '"'){ inQ = !inQ; continue; }
+    if(ch === ',' && !inQ){ res.push(cur); cur=''; continue; }
+    cur += ch;
+  }
+  res.push(cur);
+  return res.map(s=>s.trim().replace(/^"|"$/g,''));
+}
+function parseCSVText(text){
+  const lines = text.replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').map(l=>l);
+  while(lines.length && lines[0].trim()==='') lines.shift();
+  while(lines.length && lines[lines.length-1].trim()==='') lines.pop();
+  if(lines.length===0) return {header:[], rows:[]};
+  const header = splitCSVLine(lines[0]);
+  const rows = [];
+  for(let i=1;i<lines.length;i++){
+    const cols = splitCSVLine(lines[i]);
+    const obj = {};
+    for(let j=0;j<header.length;j++){
+      let v = cols[j]===undefined ? '' : cols[j];
+      v = String(v).replace(/,/g,'').trim();
+      obj[header[j]] = v;
+    }
+    rows.push(obj);
+  }
+  return {header, rows};
+}
+
+// ---------------------------
+// 전역 상태
+// ---------------------------
+let casesHeader=null, casesRows=null, casesIndex={};      // casesIndex[YYYY-MM-DD] -> {region: num}
+let popHeader=null, popRows=null, populationByYM={};     // populationByYM['YYYY-MM'] -> {region: pop}
+let regions = [];
+
+// ---------------------------
+// 파일 업로드 처리
+// ---------------------------
+const fileStatus = document.getElementById('fileStatus');
+
+document.getElementById('casesFile').addEventListener('change', async (e)=>{
+  try{
+    const txt = await e.target.files[0].text();
+    const parsed = parseCSVText(txt);
+    casesHeader = parsed.header; casesRows = parsed.rows;
+    buildCasesIndex();
+    fileStatus.innerHTML = (fileStatus.innerHTML?fileStatus.innerHTML+'<br>':'') + '📌 확진자 CSV 업로드 완료';
+  } catch(err){ fileStatus.innerHTML = '확진자 CSV 읽기 실패: ' + err.message; }
+});
+
+document.getElementById('popFile').addEventListener('change', async (e)=>{
+  try{
+    const txt = await e.target.files[0].text();
+    const parsed = parseCSVText(txt);
+    popHeader = parsed.header; popRows = parsed.rows;
+    buildPopulationIndex();
+    fileStatus.innerHTML = (fileStatus.innerHTML?fileStatus.innerHTML+'<br>':'') + '📌 인구수 CSV 업로드 완료';
+  } catch(err){ fileStatus.innerHTML = '인구 CSV 읽기 실패: ' + err.message; }
+});
+
+// ---------------------------
+// 인덱스 빌드
+// ---------------------------
+function normalizeToYYYYMMDD(raw){
+  if(!raw) return null;
+  raw = String(raw).trim();
+  // 이미 YYYY-MM-DD 형식이면 그대로 반환
+  if(/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  // YYYY.MM.DD or YYYY/MM/DD or YYYY MM DD -> 바꿔서 처리
+  const dotMatch = raw.match(/^(\d{4})[.\-\/\s](\d{1,2})[.\-\/\s](\d{1,2})$/);
+  if(dotMatch){
+    const y = dotMatch[1];
+    const mo = String(dotMatch[2]).padStart(2,'0');
+    const da = String(dotMatch[3]).padStart(2,'0');
+    return `${y}-${mo}-${da}`;
+  }
+  // YYYY-MM (월 단위) -> YYYY-MM-01
+  if(/^\d{4}-\d{2}$/.test(raw)) return raw + '-01';
+  // YYYY.MM (예: "2020.01") -> YYYY-MM-01
+  const moOnly = raw.match(/^(\d{4})[.\-\/\s](\d{1,2})$/);
+  if(moOnly){
+    return `${moOnly[1]}-${String(moOnly[2]).padStart(2,'0')}-01`;
+  }
+  // 일반적으로 Date가 파싱 가능하면 사용 (브라우저에 의존)
+  const d = new Date(raw);
+  if(!isNaN(d)){
+    return d.toISOString().slice(0,10);
+  }
+  // 마지막으로, 숫자들(년,월,일)을 유연하게 잡아보기 (예: "20200102")
+  const compact = raw.match(/^(\d{4})(\d{2})(\d{2})$/);
+  if(compact){
+    return `${compact[1]}-${compact[2]}-${compact[3]}`;
+  }
+  return null;
+}
+function normalizeToYYYYMM(raw){ const d=normalizeToYYYYMMDD(raw); return d ? d.slice(0,7) : null; }
+
+function buildCasesIndex(){
+  casesIndex = {};
+  if(!casesHeader || !casesRows) return;
+  const candidates = ['일자','Date','date','날짜','day'];
+  const dateCol = casesHeader.find(h=>candidates.includes(h)) || casesHeader[0];
+  regions = casesHeader.filter(h=>h !== dateCol);
+  for(const row of casesRows){
+    const raw = row[dateCol];
+    const norm = normalizeToYYYYMMDD(raw);
+    if(!norm) continue;
+    const rec = {};
+    for(const r of regions){
+      let v = row[r];
+      if(v === '' || v === undefined || v === '-') v = '0';
+      const n = Number(String(v).replace(/,/g,'')); rec[r] = isNaN(n) ? 0 : n;
+    }
+    casesIndex[norm] = rec;
+  }
+  populateRegionSelect(regions);
+  }
+
+function buildPopulationIndex(){
+  populationByYM = {};
+  if(!popHeader || !popRows) return;
+  const dateCandidates = ['일자','Date','date','날짜','month'];
+  const dateCol = popHeader.find(h=>dateCandidates.includes(h)) || popHeader[0];
+  const regCols = popHeader.filter(h=>h !== dateCol);
+  for(const row of popRows){
+    const raw = row[dateCol];
+    const ym = normalizeToYYYYMM(raw);
+    if(!ym) continue;
+    populationByYM[ym] = populationByYM[ym] || {};
+    for(const r of regCols){
+      let v = row[r];
+      if(v === '' || v === undefined) { populationByYM[ym][r] = null; continue; }
+      const n = Number(String(v).replace(/,/g,'')); populationByYM[ym][r] = isNaN(n) ? null : n;
+    }
+  }
+  if(regions.length === 0 && Object.keys(populationByYM).length > 0){
+    const firstYM = Object.keys(populationByYM)[0];
+    populateRegionSelect(Object.keys(populationByYM[firstYM]));
+  }
+}
+
+// ---------------------------
+// UI helper
+// ---------------------------
+function populateRegionSelect(regs){
+  const sel = document.getElementById('region');
+  sel.innerHTML = '';
+  regs.forEach(r => { const o = document.createElement('option'); o.value=r; o.textContent=r; sel.appendChild(o); });
+}
+
+// ---------------------------
+// SEIR 시뮬레이터
+// ---------------------------
+function seir_daily(I,E,S,R, beta_day, sigma, gamma, days){
+  let S0=S, E0=E, I0=I, R0=R;
+  for(let d=0; d<days; d++){
+    const newExp = beta_day * S0 * I0;
+    const dS = - newExp;
+    const dE = newExp - sigma * E0;
+    const dI = sigma * E0 - gamma * I0;
+    const dR = gamma * I0;
+    S0 += dS; E0 += dE; I0 += dI; R0 += dR;
+    S0=Math.max(0,S0); E0=Math.max(0,E0); I0=Math.max(0,I0); R0=Math.max(0,R0);
+  }
+  return {S:S0,E:E0,I:I0,R:R0};
+}
+// 하루(step) 단위의 SEIR 업데이트(비율 단위)
+// 입력/출력은 fraction(0..1)
+function seir_step(S, E, I, beta_day, sigma, gamma){
+  const newExp = beta_day * S * I;
+  const dS = - newExp;
+  const dE = newExp - sigma * E;
+  const dI = sigma * E - gamma * I;
+  const S2 = S + dS;
+  const E2 = E + dE;
+  const I2 = I + dI;
+  return { S: Math.max(0, S2), E: Math.max(0, E2), I: Math.max(0, I2) };
+}
+
+function calcBetaFromTH(T, H){
+    return -0.0001712316*(H**2)+0.0108354543*H+0.49881235810
+
+}
+// --- SEIR 기반으로 '현재 날짜까지' 모델을 맞추고
+//     내일부터 latent_days(예:2)일까지의 신규 I(=확진) 합을 반환
+// --- currentDateStr (YYYY-MM-DD), region, population 사용
+function estimateLatentsUsingSEIR(currentDateStr, region, population){
+  const dbgEl = document.getElementById('debug');
+
+  const dates = Object.keys(casesIndex).sort((a,b)=>new Date(a)-new Date(b));
+  if(dates.length === 0){
+    dbgEl.textContent += 'estimateLatentsUsingSEIR: casesIndex에 날짜가 없습니다.\n';
+    return 0;
+  }
+
+  const sigma = 1/latent_days; // E -> I 전환율 (1/day)
+  const gamma = 1/7; // 회복률 (1/day)
+
+  // 상태는 fraction (sum S+E+I+R <= 1)
+  let S = 1.0, E = 0.0, I = 0.0, R = 0.0;
+  let lastSimDate = null;
+
+  dbgEl.textContent += `--- casesIndex 샘플(최대 10개) ---\n`;
+  for(let i=0;i<Math.min(10, dates.length); i++){
+    const d = dates[i];
+    const v = (casesIndex[d] && casesIndex[d][region]) ? casesIndex[d][region] : 0;
+    dbgEl.textContent += `${d}: ${v}\n`;
+  }
+  dbgEl.textContent += `총 날짜 수: ${dates.length}\n`;
+
+  // (옵션) 보고율: 실제 발생 대비 보고된 확진 비율 (0~1). UI로 노출 권장.
+  const reporting = 1.0; // 기본 1.0 (완전보고). 현실적으론 0.2~0.6 등으로 설정 가능.
+
+  // ----------------------------
+  // 1) FITTING: "현재 날짜 - 14일" ~ "현재 날짜 직전" 까지만 사용
+  // ----------------------------
+  const currentDate = new Date(currentDateStr);
+  const fitStartDate = new Date(currentDate);
+  fitStartDate.setDate(fitStartDate.getDate() - 14);
+
+  for(const d of dates){
+    const dd = new Date(d);
+
+    // 14일 이전이면 스킵
+    if(dd < fitStartDate) continue;
+
+    // 현재 날짜는 사용 X
+    if(dd >= currentDate) break;
+
+    const realCases = (casesIndex[d] && casesIndex[d][region]) ? casesIndex[d][region] : 0;
+    const observed_frac = realCases / population; // 하루 관측 incidence (fraction)
+
+    // 관측치 역투영: observed ≈ reporting * sigma * E  => required_E = observed / (sigma * reporting)
+    if(observed_frac > 0){
+      const required_E = observed_frac / (sigma * reporting);
+
+      if(required_E > E){
+        const deltaE = required_E - E;
+        // 질량 보존: S에서 꺼내서 E로 추가
+        S -= deltaE;
+        if(S < 0){
+          // S가 부족하면 가능한 만큼만 채움
+          const actualDelta = deltaE + S; // S is negative
+          E += actualDelta > 0 ? actualDelta : 0;
+          S = Math.max(0, S);
+        } else {
+          E += deltaE;
+        }
+      }
+      // 만약 required_E <= E인 경우에는 'E를 줄이지 않음' (모델이 이미 과대평가중이라면 자연감소를 허용)
+    }
+
+    // 하루 전진 (일 단위)
+    const step = seir_step(S, E, I, beta_SEIR, sigma, gamma);
+    S = step.S; E = step.E; I = step.I;
+    R = Math.max(0, 1 - S - E - I);
+
+    lastSimDate = d;
+  }
+
+  dbgEl.textContent += `모델 피팅 종료일(포함되지 않음): ${lastSimDate}\n`;
+  dbgEl.textContent += `피팅 후 상태(S,E,I,R) 비율: ${S.toExponential(6)}, ${E.toExponential(6)}, ${I.toExponential(6)}, ${R.toExponential(6)}\n`;
+
+  // ----------------------------
+  // 2) PREDICT: "내일"과 "모레" (즉 latent_days 일수만큼 앞으로) 의 신규 합을 계산
+  //    - 각 일의 신규(명) = sigma * E_fraction * population
+  // ----------------------------
+  let fS = S, fE = E, fI = I, fR = R;
+  let sumNew = 0;
+  dbgEl.textContent += `예측 시작 상태(S,E,I): ${fS.toExponential(6)}, ${fE.toExponential(6)}, ${fI.toExponential(6)}\n`;
+  for(let k=0; k<latent_days; k++){
+    // 하루 신규(비율) = sigma * E
+    const daily_new_frac = sigma * fE;
+    const daily_new_num = daily_new_frac * population;
+    sumNew += daily_new_num;
+
+    dbgEl.textContent += `예측일 ${k+1}: daily_new_frac=${daily_new_frac.toExponential(6)} (명=${daily_new_num.toFixed(6)})\n`;
+
+    // 하루 전진
+    const st = seir_step(fS, fE, fI, beta_SEIR, sigma, gamma);
+    fS = st.S; fE = st.E; fI = st.I;
+    fR = Math.max(0, 1 - fS - fE - fI);
+  }
+
+  dbgEl.textContent += `예측 합계(sumNew, 내일+모레 신규 합): ${sumNew.toFixed(6)} 명\n`;
+  dbgEl.textContent += `------------------------------------------\n`;
+  return sumNew;
+}
+
+// ---------------------------
+// 실행: 현재 이전 데이터만 사용해서 I0/E0 추정 -> target까지 시뮬레이션 -> 환경 확률 계산
+// ---------------------------
+document.getElementById('runBtn').addEventListener('click', ()=>{
+  const T_env = Number(document.getElementById('tempInput').value);
+  const H_env = Number(document.getElementById('humInput').value);
+  const beta_env = calcBetaFromTH(T_env, H_env);
+
+  const out = document.getElementById('output');
+  const dbg = document.getElementById('debug');
+  out.innerHTML = ''; dbg.textContent = '';
+
+  if(!casesRows || !popRows){ out.innerText = '두 CSV 파일을 모두 업로드하세요.'; return; }
+
+  // target 우선: 캘린더 값 우선, 아니면 select
+  const target = document.getElementById('currentDate').value;
+  const current = document.getElementById('currentDate').value;
+  const region = document.getElementById('region').value;
+  const A = Number(document.getElementById('area').value);
+  const a = Number(document.getElementById('activity').value);
+  const T = Number(document.getElementById('duration').value);
+  const extraElem = document.getElementById('extraHours');
+  const extraH = extraElem ? (Number(extraElem.value) || 0) : 0;
+
+  
+  if(!current || !target){ out.innerText = '현재 날짜와 예측 날짜를 모두 입력/선택하세요.'; return; }
+  if(!region){ out.innerText = '지역을 선택하세요.'; return; }
+
+  const currentDate = new Date(current);
+  const targetDate = new Date(target);
+
+  // population (month)
+  const ym = target.slice(0,7);
+  const popMap = populationByYM[ym];
+  if(!popMap){ out.innerHTML = `해당 월(${ym})의 인구 데이터가 없습니다.`; return; }
+  const population = popMap[region];
+  if(!population || population <= 0){ out.innerText = '인구 데이터가 비정상입니다.'; return; }
+
+  // --- SEIR 기반 잠복자 계산 (요청한 방식)
+  // (1) casesIndex에 날짜가 전혀 없으면 종료
+  const allDates = Object.keys(casesIndex).sort((a,b)=>new Date(a)-new Date(b));
+  if(allDates.length === 0){ out.innerText = '현재 날짜 이전의 확진자 데이터가 없습니다.'; return; }
+
+  // (2) estimateLatentsUsingSEIR를 호출하여 '현재 날짜의 잠복자 수'를 얻음
+  const latentCount = estimateLatentsUsingSEIR(current, region, population); // 명
+  const E_fraction = latentCount / population; // fraction으로 변환
+
+  // debug 출력 (선택)
+  dbg.textContent += `SEIR 기반 추정 잠복자 수(명): ${latentCount.toFixed(6)}\n`;
+  dbg.textContent += `잠복자 비율: ${(E_fraction*100).toFixed(8)}%\n`;
+  dbg.textContent += `인구(월): ${population.toLocaleString()}\n`;
+  dbg.textContent += `latentCount (명): ${latentCount.toFixed(2)}\n`;
+  dbg.textContent += `E_fraction (비율): ${(E_fraction*100).toFixed(6)}%\n`;
+  dbg.textContent += `환경 베타(beta_env): ${beta_env.toExponential ? beta_env.toExponential(4) : beta_env}\n`;
+
+  // 추가 디버그: 전체 날짜 수 및 피팅 시작일(현재 runBtn 스코프에서 계산)
+  dbg.textContent += `총 날짜 수: ${allDates.length}\n`;
+  const currentDateObj = new Date(current);
+  const fitStartDateObj = new Date(currentDateObj);
+  fitStartDateObj.setDate(fitStartDateObj.getDate() - 14);
+  dbg.textContent += `SEIR 피팅 시작일: ${fitStartDateObj.toISOString().slice(0,10)}\n`;
+
+
+  // environment risk calculation
+  const r = 1; const areaCircle = Math.PI * r * r;
+  const n_risk = E_fraction * (areaCircle / A); // expected latent in radius r
+  const n_eff = a * n_risk;
+  const lambda_per_hour = beta_env * n_eff; // environment beta applied here
+  const p_no = Math.exp(- lambda_per_hour * T);
+  const P = 1 - p_no;
+
+  out.innerHTML =
+    `<b>요약</b><br>` +
+    `예측일: ${target} (월: ${ym})<br>` +
+    `지역: ${region} / 인구(월): ${population.toLocaleString()}<br>` +
+    `해당일(또는 시점) 잠복군 비율 E: ${(E_fraction*100).toFixed(6)}%<br>` +
+    `<b>λ (per hour):</b> ${lambda_per_hour.toExponential(4)}<br>` +
+    `<b>최종 감염확률:</b> ${(P*100).toFixed(6)}%`;
+
+}); // end run
+
+</script>
+</body>
+</html>
